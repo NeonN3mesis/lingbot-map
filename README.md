@@ -333,6 +333,13 @@ the dominant floor-like plane and rigidly rotate the reconstruction and camera
 poses until that plane is horizontal. This changes orientation only, not scale,
 distances, or scene shape.
 
+Use `--voxel_fusion` to replace overlapping per-frame depth sheets with one
+point per spatial voxel, retaining only voxels observed by at least two distinct
+frames. The voxel size is selected from trajectory scale by default; tune with
+`--voxel_size`, `--min_view_support`, and `--fusion_pixel_stride`. Fusion keeps
+frame playback progressive by assigning each fused voxel to the mean frame that
+observed it.
+
 #### Running on Limited GPU Memory
 
 If you run into out-of-memory issues, try one (or both) of the following:

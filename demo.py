@@ -713,6 +713,14 @@ def main():
         "--level_floor", action="store_true",
         help="Rigidly rotate reconstruction and cameras to make the fitted floor horizontal.",
     )
+    parser.add_argument("--voxel_fusion", action="store_true",
+                        help="Fuse voxels supported by multiple frames for cleaner surfaces.")
+    parser.add_argument("--voxel_size", type=float, default=0.0,
+                        help="World-space voxel size; 0 chooses from camera trajectory extent.")
+    parser.add_argument("--min_view_support", type=int, default=2,
+                        help="Distinct frames required to retain a fused voxel.")
+    parser.add_argument("--fusion_pixel_stride", type=int, default=2,
+                        help="Pixel stride used to build the fused cloud.")
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
@@ -775,6 +783,11 @@ def main():
         args.show_camera = True
     if args.depth_edge_threshold is None:
         args.depth_edge_threshold = 0.0
+    if args.voxel_fusion:
+        if "--downsample_factor" not in sys.argv:
+            args.downsample_factor = 1
+        if "--point_size" not in sys.argv:
+            args.point_size = 0.002
 
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
@@ -958,6 +971,10 @@ def main():
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
             depth_edge_threshold=args.depth_edge_threshold,
             excluded_frames=args.exclude_point_frames,
+            voxel_fusion=args.voxel_fusion,
+            voxel_size=args.voxel_size,
+            min_view_support=args.min_view_support,
+            fusion_pixel_stride=args.fusion_pixel_stride,
         )
         print(f"3D viewer at http://localhost:{args.port}")
         viewer.run()

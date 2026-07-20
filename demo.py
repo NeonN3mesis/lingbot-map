@@ -514,7 +514,7 @@ def main():
                     "--allow_unsafe_rocm_streaming for diagnostics."
                 )
         if "--conf_threshold" not in sys.argv:
-            args.conf_threshold = 1.0
+            args.conf_threshold = 1.5
         if "--downsample_factor" not in sys.argv:
             args.downsample_factor = 2
         if "--point_size" not in sys.argv:

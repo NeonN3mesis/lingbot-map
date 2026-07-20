@@ -313,7 +313,7 @@ python demo.py --model_path /path/to/checkpoint.pt \
 ```
 
 The viewer opens paused on the final frame in accumulated 3D mode, with camera
-frustums hidden. On AMD the initial confidence threshold is `1.0`, point size is
+frustums hidden. On AMD the initial confidence threshold is `1.5`, point size is
 `0.001`, display downsampling is `2`, and a conservative relative depth-edge
 filter of `0.15` removes boundary streaks before unprojection. Explicit CLI
 values still override these visualization defaults. Use

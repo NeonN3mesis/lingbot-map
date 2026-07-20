@@ -92,7 +92,10 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
         paths = []
         for ext in exts:
             paths.extend(glob.glob(os.path.join(image_folder, f"*{ext}")))
-        paths = sorted(paths)
+        # A case-insensitive filesystem can return the same file for both
+        # ``*.jpg`` and ``*.JPG``. Duplicate adjacent frames erase parallax and
+        # noticeably degrade reconstruction, so dedupe by normalized path.
+        paths = sorted({os.path.normcase(os.path.abspath(path)): path for path in paths}.values())
         resolved_folder = image_folder
 
     if first_k is not None and first_k > 0:
@@ -335,6 +338,51 @@ def prepare_for_visualization(predictions, images=None):
     return vis_predictions
 
 
+def validate_predictions(predictions, stage="inference"):
+    """Reject numerically corrupt reconstructions before opening the viewer."""
+    required = ("pose_enc", "depth", "depth_conf")
+    problems = []
+
+    for key in required:
+        value = predictions.get(key)
+        if not isinstance(value, torch.Tensor):
+            problems.append(f"missing tensor {key!r}")
+            continue
+
+        finite = torch.isfinite(value)
+        if finite.all():
+            continue
+
+        # Model outputs are [B, S, ...] before post-processing and [S, ...]
+        # afterwards. Report the first affected frame in either representation.
+        frame_dim = 1 if value.ndim == _BATCHED_NDIMS.get(key) else 0
+        reduce_dims = tuple(i for i in range(value.ndim) if i != frame_dim)
+        frame_ok = finite.all(dim=reduce_dims)
+        bad_frames = (~frame_ok).nonzero(as_tuple=False).flatten().tolist()
+        finite_pct = 100.0 * finite.float().mean().item()
+        problems.append(
+            f"{key} is {finite_pct:.2f}% finite; first bad frame={bad_frames[0]}"
+        )
+
+    depth = predictions.get("depth")
+    if isinstance(depth, torch.Tensor) and torch.isfinite(depth).any():
+        finite_depth = depth[torch.isfinite(depth)]
+        positive_pct = 100.0 * (finite_depth > 0).float().mean().item()
+        if positive_pct < 99.0:
+            problems.append(f"depth is only {positive_pct:.2f}% positive")
+
+    if problems:
+        hint = ""
+        if torch.version.hip is not None:
+            hint = (
+                " AMD/ROCm streaming SDPA is known to corrupt the growing KV cache; "
+                "use --mode windowed --window_size 8 --overlap_size 4."
+            )
+        raise RuntimeError(
+            f"Invalid reconstruction after {stage}: " + "; ".join(problems) + "." + hint
+        )
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -406,6 +454,19 @@ def main():
     parser.add_argument("--conf_threshold", type=float, default=1.5)
     parser.add_argument("--downsample_factor", type=int, default=10)
     parser.add_argument("--point_size", type=float, default=0.00001)
+    parser.add_argument(
+        "--depth_edge_threshold", type=float, default=None,
+        help="Remove points beside relative depth jumps larger than this ratio; "
+             "0 disables it (AMD inspection preset: 0.15).",
+    )
+    parser.add_argument(
+        "--show_camera", action=argparse.BooleanOptionalAction, default=None,
+        help="Show camera frustums in the viewer (AMD inspection preset: off).",
+    )
+    parser.add_argument(
+        "--allow_unsafe_rocm_streaming", action="store_true", default=False,
+        help="Allow known-corrupt growing SDPA KV-cache paths on ROCm.",
+    )
     parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
     parser.add_argument("--sky_mask_dir", type=str, default=None,
                         help="Directory for cached sky masks (default: <image_folder>_sky_masks/)")
@@ -419,6 +480,58 @@ def main():
         "Provide --image_folder or --video_path"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # The CUDA-shaped PyTorch API is also used by ROCm. On AMD, FlashInfer is
+    # unavailable and the growing dict-based SDPA cache currently becomes
+    # non-finite after the first streamed frame. Short overlapping windows keep
+    # each window entirely in the stable scale phase.
+    is_rocm = torch.version.hip is not None
+    if is_rocm:
+        args.use_sdpa = True
+        mode_was_explicit = "--mode" in sys.argv
+        if args.mode == "streaming":
+            if mode_was_explicit and not args.allow_unsafe_rocm_streaming:
+                parser.error(
+                    "ROCm streaming SDPA produces non-finite predictions. "
+                    "Use --mode windowed (recommended), or explicitly pass "
+                    "--allow_unsafe_rocm_streaming for diagnostics."
+                )
+            if not mode_was_explicit:
+                args.mode = "windowed"
+        if args.mode == "windowed":
+            if "--window_size" not in sys.argv:
+                args.window_size = 8
+            if "--overlap_size" not in sys.argv and "--overlap_keyframes" not in sys.argv:
+                args.overlap_size = 4
+            if (
+                args.window_size > args.num_scale_frames
+                and not args.allow_unsafe_rocm_streaming
+            ):
+                parser.error(
+                    "ROCm SDPA becomes non-finite when a window grows beyond "
+                    f"the {args.num_scale_frames} scale frames. Use "
+                    f"--window_size {args.num_scale_frames}, or explicitly pass "
+                    "--allow_unsafe_rocm_streaming for diagnostics."
+                )
+        if "--conf_threshold" not in sys.argv:
+            args.conf_threshold = 1.0
+        if "--downsample_factor" not in sys.argv:
+            args.downsample_factor = 2
+        if "--point_size" not in sys.argv:
+            args.point_size = 0.001
+        if args.depth_edge_threshold is None:
+            args.depth_edge_threshold = 0.15
+        if args.show_camera is None:
+            args.show_camera = False
+        print(
+            "ROCm preset: SDPA + "
+            f"{args.mode} mode"
+            + (f" (window={args.window_size}, overlap={args.overlap_size})" if args.mode == "windowed" else "")
+        )
+    elif args.show_camera is None:
+        args.show_camera = True
+    if args.depth_edge_threshold is None:
+        args.depth_edge_threshold = 0.0
 
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
@@ -562,6 +675,7 @@ def main():
             )
 
     print(f"Inference done in {time.time() - t0:.1f}s")
+    validate_predictions(predictions)
     if torch.cuda.is_available():
         print(
             f"GPU peak during inference: "
@@ -589,10 +703,12 @@ def main():
             vis_threshold=args.conf_threshold,
             downsample_factor=args.downsample_factor,
             point_size=args.point_size,
+            show_camera=args.show_camera,
             mask_sky=args.mask_sky,
             image_folder=resolved_image_folder,
             sky_mask_dir=args.sky_mask_dir,
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
+            depth_edge_threshold=args.depth_edge_threshold,
         )
         print(f"3D viewer at http://localhost:{args.port}")
         viewer.run()

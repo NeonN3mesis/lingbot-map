@@ -299,6 +299,27 @@ python demo.py --model_path /path/to/checkpoint.pt \
     --image_folder /path/to/images/ --use_sdpa
 ```
 
+#### AMD ROCm
+
+`demo.py` detects ROCm and automatically selects the validated AMD preset:
+SDPA, 8-frame windows with 4-frame overlap, and inspection-oriented viewer
+defaults. The growing streaming SDPA cache currently becomes non-finite on
+ROCm, so larger windows and explicit streaming mode are rejected before model
+loading unless `--allow_unsafe_rocm_streaming` is passed for diagnostics.
+
+```bash
+python demo.py --model_path /path/to/checkpoint.pt \
+    --image_folder example/loop
+```
+
+The viewer opens paused on the final frame in accumulated 3D mode, with camera
+frustums hidden. On AMD the initial confidence threshold is `1.0`, point size is
+`0.001`, display downsampling is `2`, and a conservative relative depth-edge
+filter of `0.15` removes boundary streaks before unprojection. Explicit CLI
+values still override these visualization defaults. Use
+`--depth_edge_threshold 0` to disable the filter or provide another positive
+ratio to tune it for a scene.
+
 #### Running on Limited GPU Memory
 
 If you run into out-of-memory issues, try one (or both) of the following:

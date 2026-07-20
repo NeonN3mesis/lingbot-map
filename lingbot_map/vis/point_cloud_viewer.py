@@ -92,6 +92,7 @@ class PointCloudViewer:
         sky_mask_dir: Optional[str] = None,
         sky_mask_visualization_dir: Optional[str] = None,
         depth_stride: int = 1,
+        depth_edge_threshold: float = 0.0,
     ):
         self.model = model
         self.size = size
@@ -102,6 +103,7 @@ class PointCloudViewer:
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
         self.point_size = point_size
+        self.downsample_factor = downsample_factor
         self.tt = lambda x: torch.from_numpy(x).float().to(device)
 
         # Process the prediction dictionary to create pc_list, color_list, conf_list
@@ -111,6 +113,7 @@ class PointCloudViewer:
                 sky_mask_dir=sky_mask_dir,
                 sky_mask_visualization_dir=sky_mask_visualization_dir,
                 depth_stride=depth_stride,
+                depth_edge_threshold=depth_edge_threshold,
             )
         else:
             self.original_images = []
@@ -140,6 +143,7 @@ class PointCloudViewer:
         sky_mask_dir: Optional[str] = None,
         sky_mask_visualization_dir: Optional[str] = None,
         depth_stride: int = 1,
+        depth_edge_threshold: float = 0.0,
     ) -> Tuple[List, List, List, Dict]:
         """Process prediction dictionary to extract visualization data.
 
@@ -153,6 +157,8 @@ class PointCloudViewer:
             depth_stride: Only project depth to point cloud every N frames.
                 Frames not projected will have empty point clouds but still
                 show camera frustums and images. 1 = every frame (default).
+            depth_edge_threshold: Reject pixels whose relative depth jump to
+                a direct neighbour exceeds this ratio. 0 disables filtering.
         """
         images = pred_dict["images"]  # (S, 3, H, W)
 
@@ -169,6 +175,17 @@ class PointCloudViewer:
         else:
             world_points = pred_dict["world_points"]  # (S, H, W, 3)
             conf = pred_dict.get("world_points_conf", depth_conf)  # (S, H, W)
+
+        if depth_edge_threshold > 0 and depth_map is not None:
+            edge_mask = self.depth_continuity_mask(depth_map[..., 0], depth_edge_threshold)
+            conf = np.asarray(conf).copy() if conf is not None else edge_mask.astype(np.float32)
+            conf[~edge_mask] = 0.0
+            rejected = int((~edge_mask).sum())
+            total = int(edge_mask.size)
+            print(
+                f"  depth-edge filter={depth_edge_threshold:g}: "
+                f"rejected {rejected:,}/{total:,} pixels ({100 * rejected / max(total, 1):.1f}%)"
+            )
 
         # Apply sky segmentation if enabled
         if mask_sky:
@@ -223,6 +240,30 @@ class PointCloudViewer:
         }
 
         return pc_list, color_list, conf_list, cam_dict
+
+    @staticmethod
+    def depth_continuity_mask(depth: np.ndarray, threshold: float) -> np.ndarray:
+        """Return pixels not adjacent to a large relative depth discontinuity.
+
+        Comparing against the nearer of the two depths makes the threshold
+        scale-independent. Invalid and non-positive depths are always rejected.
+        """
+        depth = np.asarray(depth, dtype=np.float32)
+        valid = np.isfinite(depth) & (depth > 0)
+        keep = valid.copy()
+        eps = np.finfo(np.float32).eps
+        for axis in (-2, -1):
+            left = [slice(None)] * depth.ndim
+            right = [slice(None)] * depth.ndim
+            left[axis] = slice(None, -1)
+            right[axis] = slice(1, None)
+            a, b = depth[tuple(left)], depth[tuple(right)]
+            pair_valid = valid[tuple(left)] & valid[tuple(right)]
+            relative_jump = np.abs(a - b) / np.maximum(np.minimum(a, b), eps)
+            smooth = pair_valid & (relative_jump <= threshold)
+            keep[tuple(left)] &= smooth
+            keep[tuple(right)] &= smooth
+        return keep
 
     def _compute_scene_center_and_scale(self) -> Tuple[np.ndarray, float]:
         """Compute scene center and scale from camera positions and point clouds.
@@ -304,17 +345,17 @@ class PointCloudViewer:
             )
 
         # Video frame display controls — kept at top so the current frame is always visible
-        with self.server.gui.add_folder("Video Display"):
+        with self.server.gui.add_folder("Video Display", expand_by_default=False):
             self.show_video_checkbox = self.server.gui.add_checkbox("Show Current Frame", initial_value=True)
             if hasattr(self, 'original_images') and len(self.original_images) > 0:
                 self.current_frame_image = self.server.gui.add_image(
-                    self.original_images[0], label="Current Frame"
+                    self.original_images[-1], label="Current Frame"
                 )
             else:
                 self.current_frame_image = None
 
         # Preset view direction buttons
-        with self.server.gui.add_folder("Reset View Direction"):
+        with self.server.gui.add_folder("Reset View Direction", expand_by_default=False):
             btn_look_at_center = self.server.gui.add_button(
                 "Look At Scene Center",
                 hint="Reset orbit center to the scene center (fixes orbit after dragging).",
@@ -409,7 +450,8 @@ class PointCloudViewer:
             "Camera Size", min=0.01, max=0.5, step=0.01, initial_value=0.1
         )
         self.downsample_slider = self.server.gui.add_slider(
-            "Downsample Factor", min=1, max=1000, step=1, initial_value=10
+            "Downsample Factor", min=1, max=1000, step=1,
+            initial_value=self.downsample_factor
         )
         self.show_camera_checkbox = self.server.gui.add_checkbox(
             "Show Camera", initial_value=self.show_camera
@@ -423,7 +465,7 @@ class PointCloudViewer:
         )
 
         # Screenshot controls
-        with self.server.gui.add_folder("Screenshot"):
+        with self.server.gui.add_folder("Screenshot", expand_by_default=False):
             self.screenshot_button = self.server.gui.add_button("Take Screenshot")
             self.screenshot_resolution = self.server.gui.add_dropdown(
                 "Resolution",
@@ -442,7 +484,7 @@ class PointCloudViewer:
             self._take_screenshot(event.client)
 
         # GLB export controls
-        with self.server.gui.add_folder("Export GLB"):
+        with self.server.gui.add_folder("Export GLB", expand_by_default=False):
             self.glb_output_path = self.server.gui.add_text(
                 "Output Path", initial_value="export.glb"
             )
@@ -510,7 +552,7 @@ class PointCloudViewer:
             self._export_glb()
 
         # Video saving controls
-        with self.server.gui.add_folder("Video Saving"):
+        with self.server.gui.add_folder("Video Saving", expand_by_default=False):
             self.save_video_button = self.server.gui.add_button("Save Video", disabled=False)
             self.video_output_path = self.server.gui.add_text("Output Path", initial_value="output_pointcloud.mp4")
             self.video_save_fps = self.server.gui.add_slider("Video FPS", min=10, max=60, step=1, initial_value=30)
@@ -988,6 +1030,15 @@ class PointCloudViewer:
 
     def _connect_client(self, client: viser.ClientHandle):
         """Setup client connection callbacks."""
+        # Start in a stable reconstruction overview instead of relying on the
+        # browser's arbitrary initial orbit pose.
+        center, scale = self._compute_scene_center_and_scale()
+        direction = np.array([0.5, -0.6, 0.6], dtype=np.float64)
+        direction /= np.linalg.norm(direction)
+        client.camera.up_direction = (0.0, -1.0, 0.0)
+        client.camera.position = tuple(center + direction * scale * 1.5)
+        client.camera.look_at = tuple(center)
+
         wxyz_panel = client.gui.add_text("wxyz:", f"{client.camera.wxyz}")
         position_panel = client.gui.add_text("position:", f"{client.camera.position}")
         fov_panel = client.gui.add_text(
@@ -1168,11 +1219,12 @@ class PointCloudViewer:
         """Setup and run animation controls."""
         with self.server.gui.add_folder("Playback"):
             self.gui_timestep = self.server.gui.add_slider(
-                "Train Step", min=0, max=self.num_frames - 1, step=1, initial_value=0, disabled=False
+                "Frame", min=0, max=self.num_frames - 1, step=1,
+                initial_value=self.num_frames - 1, disabled=False
             )
             gui_next_frame = self.server.gui.add_button("Next Step", disabled=False)
             gui_prev_frame = self.server.gui.add_button("Prev Step", disabled=False)
-            gui_playing = self.server.gui.add_checkbox("Playing", True)
+            gui_playing = self.server.gui.add_checkbox("Playing", False)
             gui_framerate = self.server.gui.add_slider("FPS", min=1, max=60, step=0.1, initial_value=20)
             gui_framerate_options = self.server.gui.add_button_group("FPS options", ("10", "20", "30", "60"))
 

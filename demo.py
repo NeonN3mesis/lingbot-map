@@ -454,6 +454,29 @@ def diagnose_geometry(predictions, conf_threshold=1.5, sample_step=8):
     return rows
 
 
+def parse_frame_spec(spec):
+    """Parse comma-separated frame numbers and inclusive ranges."""
+    frames = set()
+    if not spec:
+        return frames
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if start < 0 or end < start:
+                raise ValueError(f"invalid frame range: {token!r}")
+            frames.update(range(start, end + 1))
+        else:
+            frame = int(token)
+            if frame < 0:
+                raise ValueError(f"invalid frame number: {token!r}")
+            frames.add(frame)
+    return frames
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -547,10 +570,19 @@ def main():
                         help="Export stride-sampled, resized/cropped images to this folder")
     parser.add_argument("--diagnose_geometry", action="store_true",
                         help="Print frame-level slab and pose-jump diagnostics")
+    parser.add_argument(
+        "--exclude_point_frames", type=str, default="",
+        help="Exclude frames from point-cloud display, but keep them in inference. "
+             "Accepts comma-separated indices/ranges such as '3,8-10'.",
+    )
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
         "Provide --image_folder or --video_path"
+    try:
+        args.exclude_point_frames = parse_frame_spec(args.exclude_point_frames)
+    except ValueError as error:
+        parser.error(str(error))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -784,6 +816,7 @@ def main():
             sky_mask_dir=args.sky_mask_dir,
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
             depth_edge_threshold=args.depth_edge_threshold,
+            excluded_frames=args.exclude_point_frames,
         )
         print(f"3D viewer at http://localhost:{args.port}")
         viewer.run()

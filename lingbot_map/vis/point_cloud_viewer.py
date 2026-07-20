@@ -93,6 +93,7 @@ class PointCloudViewer:
         sky_mask_visualization_dir: Optional[str] = None,
         depth_stride: int = 1,
         depth_edge_threshold: float = 0.0,
+        excluded_frames: Optional[set] = None,
     ):
         self.model = model
         self.size = size
@@ -114,6 +115,7 @@ class PointCloudViewer:
                 sky_mask_visualization_dir=sky_mask_visualization_dir,
                 depth_stride=depth_stride,
                 depth_edge_threshold=depth_edge_threshold,
+                excluded_frames=excluded_frames,
             )
         else:
             self.original_images = []
@@ -144,6 +146,7 @@ class PointCloudViewer:
         sky_mask_visualization_dir: Optional[str] = None,
         depth_stride: int = 1,
         depth_edge_threshold: float = 0.0,
+        excluded_frames: Optional[set] = None,
     ) -> Tuple[List, List, List, Dict]:
         """Process prediction dictionary to extract visualization data.
 
@@ -159,6 +162,8 @@ class PointCloudViewer:
                 show camera frustums and images. 1 = every frame (default).
             depth_edge_threshold: Reject pixels whose relative depth jump to
                 a direct neighbour exceeds this ratio. 0 disables filtering.
+            excluded_frames: Frame indices omitted from point-cloud display.
+                Their camera poses and images remain available.
         """
         images = pred_dict["images"]  # (S, 3, H, W)
 
@@ -212,8 +217,9 @@ class PointCloudViewer:
         color_list = []
         conf_list = []
         skipped = 0
+        excluded_frames = set(excluded_frames or ())
         for i in range(S):
-            if depth_stride > 1 and i % depth_stride != 0:
+            if i in excluded_frames or (depth_stride > 1 and i % depth_stride != 0):
                 # Empty point cloud for skipped frames
                 pc_list.append(np.zeros((0, 0, 3), dtype=np.float32))
                 color_list.append(np.zeros((0, 0, 3), dtype=np.float32))
@@ -229,6 +235,9 @@ class PointCloudViewer:
 
         if depth_stride > 1:
             print(f'  depth_stride={depth_stride}: projecting {S - skipped}/{S} frames, skipping {skipped}')
+        if excluded_frames:
+            shown = sorted(frame for frame in excluded_frames if 0 <= frame < S)
+            print(f"  excluded point-cloud frames: {shown}")
 
         # Create camera dictionary (all frames keep cameras)
         cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)

@@ -323,6 +323,9 @@ ratio to tune it for a scene.
 Use `--diagnose_geometry` when a reconstruction contains apparent sheets or
 discontinuities. It reports unusually planar frame clouds, camera-pose jumps,
 and per-window alignment scales without changing the reconstruction.
+Once a bad depth frame is identified, `--exclude_point_frames 3,8-10` omits
+those frames from displayed geometry while preserving their inference context,
+camera poses, and source images.
 
 #### Running on Limited GPU Memory
 

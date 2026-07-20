@@ -387,8 +387,8 @@ def validate_predictions(predictions, stage="inference"):
         hint = ""
         if torch.version.hip is not None:
             hint = (
-                " AMD/ROCm streaming SDPA is known to corrupt the growing KV cache; "
-                "use --mode windowed --window_size 8 --overlap_size 4."
+                " On AMD/ROCm, keep the validated 518x294 input shape; if the "
+                "failure persists, try --mode windowed to reset model state."
             )
         raise RuntimeError(
             f"Invalid reconstruction after {stage}: " + "; ".join(problems) + "." + hint
@@ -707,7 +707,7 @@ def main():
     )
     parser.add_argument(
         "--allow_unsafe_rocm_streaming", action="store_true", default=False,
-        help="Allow known-corrupt growing SDPA KV-cache paths on ROCm.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
     parser.add_argument("--sky_mask_dir", type=str, default=None,
@@ -747,38 +747,12 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # The CUDA-shaped PyTorch API is also used by ROCm. On AMD, FlashInfer is
-    # unavailable and the growing dict-based SDPA cache currently becomes
-    # non-finite after the first streamed frame. Short overlapping windows keep
-    # each window entirely in the stable scale phase.
+    # The CUDA-shaped PyTorch API is also used by ROCm. FlashInfer is unavailable
+    # there, so select SDPA and conservative input/viewer defaults. The model's
+    # prediction-head workaround handles ROCm's corrupt single-frame DPT kernels.
     is_rocm = torch.version.hip is not None
     if is_rocm:
         args.use_sdpa = True
-        mode_was_explicit = "--mode" in sys.argv
-        if args.mode == "streaming":
-            if mode_was_explicit and not args.allow_unsafe_rocm_streaming:
-                parser.error(
-                    "ROCm streaming SDPA produces non-finite predictions. "
-                    "Use --mode windowed (recommended), or explicitly pass "
-                    "--allow_unsafe_rocm_streaming for diagnostics."
-                )
-            if not mode_was_explicit:
-                args.mode = "windowed"
-        if args.mode == "windowed":
-            if "--window_size" not in sys.argv:
-                args.window_size = 8
-            if "--overlap_size" not in sys.argv and "--overlap_keyframes" not in sys.argv:
-                args.overlap_size = 4
-            if (
-                args.window_size > args.num_scale_frames
-                and not args.allow_unsafe_rocm_streaming
-            ):
-                parser.error(
-                    "ROCm SDPA becomes non-finite when a window grows beyond "
-                    f"the {args.num_scale_frames} scale frames. Use "
-                    f"--window_size {args.num_scale_frames}, or explicitly pass "
-                    "--allow_unsafe_rocm_streaming for diagnostics."
-                )
         if "--conf_threshold" not in sys.argv:
             args.conf_threshold = 1.5
         if "--downsample_factor" not in sys.argv:

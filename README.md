@@ -302,15 +302,22 @@ python demo.py --model_path /path/to/checkpoint.pt \
 #### AMD ROCm
 
 `demo.py` detects ROCm and automatically selects the validated AMD preset:
-SDPA, 8-frame windows with 4-frame overlap, and inspection-oriented viewer
-defaults. The growing streaming SDPA cache currently becomes non-finite on
-ROCm, so larger windows and explicit streaming mode are rejected before model
-loading unless `--allow_unsafe_rocm_streaming` is passed for diagnostics.
+SDPA, streaming inference, a stable prediction-head batch workaround, and
+inspection-oriented viewer defaults. ROCm's single-frame DPT convolution path
+produced non-finite depth and confidence values; the workaround evaluates eight
+identical independent head samples and keeps the first result. The transformer
+still processes each new frame only once. A 64-frame RX 7900 XTX validation was
+fully finite at 518x294, using 12.5 GB allocated and 15.0 GB reserved peak VRAM.
 
 ```bash
 python demo.py --model_path /path/to/checkpoint.pt \
     --image_folder example/loop
 ```
+
+Streaming preserves one continuous model state and is now the AMD default.
+Use `--mode windowed` when a sequence exceeds the model's learned motion range
+or camera poses begin to drift; windowing is a quality/reset option rather than
+a numerical-stability requirement.
 
 The viewer opens paused on the final frame in accumulated 3D mode, with camera
 frustums hidden. On AMD the initial confidence threshold is `1.5`, point size is

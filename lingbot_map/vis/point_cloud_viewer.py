@@ -96,7 +96,7 @@ class PointCloudViewer:
         excluded_frames: Optional[set] = None,
         voxel_fusion: bool = False,
         voxel_size: float = 0.0,
-        min_view_support: int = 2,
+        min_view_support: int = 0,
         fusion_pixel_stride: int = 2,
     ):
         self.model = model
@@ -157,7 +157,7 @@ class PointCloudViewer:
         excluded_frames: Optional[set] = None,
         voxel_fusion: bool = False,
         voxel_size: float = 0.0,
-        min_view_support: int = 2,
+        min_view_support: int = 0,
         fusion_pixel_stride: int = 2,
     ) -> Tuple[List, List, List, Dict]:
         """Process prediction dictionary to extract visualization data.
@@ -178,7 +178,8 @@ class PointCloudViewer:
                 Their camera poses and images remain available.
             voxel_fusion: Fuse agreeing observations into one point per voxel.
             voxel_size: World-space voxel edge length; 0 selects from trajectory scale.
-            min_view_support: Distinct frames required to retain a voxel.
+            min_view_support: Distinct frames required to retain a voxel. 0
+                selects two views when consensus coverage is healthy, else one.
             fusion_pixel_stride: Input pixel stride used while building voxels.
         """
         images = pred_dict["images"]  # (S, 3, H, W)
@@ -238,7 +239,8 @@ class PointCloudViewer:
             )
             print(
                 f"  voxel fusion: size={effective_voxel_size:.5g}, "
-                f"support={min_view_support} frames, input_stride={fusion_pixel_stride}"
+                f"support={'adaptive' if min_view_support == 0 else str(min_view_support) + ' frames'}, "
+                f"input_stride={fusion_pixel_stride}"
             )
 
         # Store original images for camera frustum display
@@ -298,8 +300,8 @@ class PointCloudViewer:
         """Fuse points into voxels supported by distinct source frames."""
         if voxel_size <= 0:
             raise ValueError("voxel_size must be positive")
-        if min_view_support < 1:
-            raise ValueError("min_view_support must be at least 1")
+        if min_view_support < 0:
+            raise ValueError("min_view_support must be non-negative")
         excluded_frames = set(excluded_frames or ())
         points_parts, color_parts, frame_parts = [], [], []
         frame_count = len(world_points)
@@ -332,7 +334,16 @@ class PointCloudViewer:
         pair_ids = inverse.astype(np.int64) * frame_count + frame_ids
         unique_pairs = np.unique(pair_ids)
         support = np.bincount(unique_pairs // frame_count, minlength=voxel_count)
-        keep_voxel = support >= min_view_support
+        if min_view_support == 0:
+            two_view_coverage = float(np.mean(support >= 2))
+            effective_support = 2 if two_view_coverage >= 0.35 else 1
+            print(
+                f"  adaptive voxel support: two-view coverage={100 * two_view_coverage:.1f}% "
+                f"-> require {effective_support} frame{'s' if effective_support != 1 else ''}"
+            )
+        else:
+            effective_support = min_view_support
+        keep_voxel = support >= effective_support
 
         sums = np.stack([
             np.bincount(inverse, weights=points[:, axis], minlength=voxel_count)

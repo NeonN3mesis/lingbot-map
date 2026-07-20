@@ -731,8 +731,9 @@ def main():
                         help="Fuse voxels supported by multiple frames for cleaner surfaces.")
     parser.add_argument("--voxel_size", type=float, default=0.0,
                         help="World-space voxel size; 0 chooses from camera trajectory extent.")
-    parser.add_argument("--min_view_support", type=int, default=2,
-                        help="Distinct frames required to retain a fused voxel.")
+    parser.add_argument("--min_view_support", type=int, default=0,
+                        help="Distinct frames required to retain a fused voxel; "
+                             "0 adaptively chooses one or two (default).")
     parser.add_argument("--fusion_pixel_stride", type=int, default=2,
                         help="Pixel stride used to build the fused cloud.")
 

@@ -345,6 +345,9 @@ frames. The voxel size is selected from trajectory scale by default; tune with
 frame playback progressive by assigning each fused voxel to the mean frame that
 observed it. The automatic size targets roughly 1/430 of the reconstructed
 camera-trajectory extent; use a smaller explicit size for more density.
+`--min_view_support 0` is adaptive: it requires two-frame agreement when at
+least 35% of occupied voxels have it, then falls back to one-frame voxel
+averaging for poorly aligned scenes where strict consensus would be illegible.
 
 #### Running on Limited GPU Memory
 

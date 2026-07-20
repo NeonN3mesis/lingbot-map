@@ -35,6 +35,19 @@ class VoxelFusionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PointCloudViewer.fuse_multiview_voxels(data, data, conf, 0.0, 0.0)
 
+    def test_adaptive_support_preserves_low_overlap_scene(self):
+        points = np.array([
+            [[[0.0, 0.0, 0.0]]],
+            [[[1.0, 0.0, 0.0]]],
+        ], dtype=np.float32)
+        colors = np.ones_like(points)
+        conf = np.full((2, 1, 1), 2.0, dtype=np.float32)
+        fused, _, _ = PointCloudViewer.fuse_multiview_voxels(
+            points, colors, conf, conf_threshold=1.5,
+            voxel_size=0.1, min_view_support=0, pixel_stride=1,
+        )
+        self.assertEqual(sum(len(x) for x in fused), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

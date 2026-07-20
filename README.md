@@ -338,7 +338,8 @@ point per spatial voxel, retaining only voxels observed by at least two distinct
 frames. The voxel size is selected from trajectory scale by default; tune with
 `--voxel_size`, `--min_view_support`, and `--fusion_pixel_stride`. Fusion keeps
 frame playback progressive by assigning each fused voxel to the mean frame that
-observed it.
+observed it. The automatic size targets roughly 1/430 of the reconstructed
+camera-trajectory extent; use a smaller explicit size for more density.
 
 #### Running on Limited GPU Memory
 

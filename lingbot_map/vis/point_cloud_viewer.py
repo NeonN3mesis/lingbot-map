@@ -225,7 +225,9 @@ class PointCloudViewer:
         if voxel_fusion:
             camera_positions = cam_to_world_mat[:, :3, 3]
             trajectory_extent = float(np.linalg.norm(np.ptp(camera_positions, axis=0)))
-            effective_voxel_size = voxel_size if voxel_size > 0 else max(trajectory_extent / 250.0, 0.005)
+            # A ~1/430 trajectory ratio preserved useful corridor detail in the
+            # real AMD test while still merging repeated depth sheets.
+            effective_voxel_size = voxel_size if voxel_size > 0 else max(trajectory_extent / 430.0, 0.005)
             world_points, colors, conf = self.fuse_multiview_voxels(
                 world_points, colors, conf,
                 conf_threshold=self.vis_threshold,

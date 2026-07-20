@@ -58,7 +58,7 @@ from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png,.JPG",
                 first_k=None, stride=1, image_size=518, patch_size=14, num_workers=8,
-                rotate_clockwise_90=False):
+                rotate_clockwise_90=False, max_image_height=None):
     """Load images from folder or video and preprocess into a tensor.
 
     Returns:
@@ -125,6 +125,15 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
         image_size=image_size,
         patch_size=patch_size,
     )
+    if max_image_height is not None and images.shape[-2] > max_image_height:
+        original_height = images.shape[-2]
+        target_height = max(patch_size, (max_image_height // patch_size) * patch_size)
+        start = (images.shape[-2] - target_height) // 2
+        images = images[..., start:start + target_height, :]
+        print(
+            f"Center-cropped preprocessed height from {original_height} "
+            f"to {target_height} for backend stability"
+        )
     h, w = images.shape[-2:]
     print(f"Preprocessed images to {w}x{h} using canonical crop mode")
     return images, paths, resolved_folder
@@ -632,6 +641,11 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--image_size", type=int, default=518)
     parser.add_argument("--patch_size", type=int, default=14)
+    parser.add_argument(
+        "--max_image_height", type=int, default=None,
+        help="Center-crop preprocessed images to this maximum patch-aligned height "
+             "(ROCm preset: 294).",
+    )
 
     # Inference mode
     parser.add_argument("--mode", type=str, default="streaming", choices=["streaming", "windowed"],
@@ -772,6 +786,8 @@ def main():
             args.point_size = 0.001
         if args.depth_edge_threshold is None:
             args.depth_edge_threshold = 0.15
+        if args.max_image_height is None:
+            args.max_image_height = 294
         if args.show_camera is None:
             args.show_camera = False
         print(
@@ -796,6 +812,7 @@ def main():
         fps=args.fps, first_k=args.first_k, stride=args.stride,
         image_size=args.image_size, patch_size=args.patch_size,
         rotate_clockwise_90=args.rotate_clockwise_90,
+        max_image_height=args.max_image_height,
     )
 
     # Export preprocessed images if requested

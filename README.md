@@ -320,6 +320,11 @@ values still override these visualization defaults. Use
 `--depth_edge_threshold 0` to disable the filter or provide another positive
 ratio to tune it for a scene.
 
+ROCm also caps preprocessed height at `294` while retaining the checkpoint's
+required `518` width. The tested 518×392 SDPA shape produced non-finite depth on
+AMD; `--max_image_height` can override the center-crop cap when testing another
+backend or PyTorch build.
+
 Use `--diagnose_geometry` when a reconstruction contains apparent sheets or
 discontinuities. It reports unusually planar frame clouds, camera-pose jumps,
 and per-window alignment scales without changing the reconstruction.

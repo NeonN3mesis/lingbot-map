@@ -320,6 +320,10 @@ values still override these visualization defaults. Use
 `--depth_edge_threshold 0` to disable the filter or provide another positive
 ratio to tune it for a scene.
 
+Use `--diagnose_geometry` when a reconstruction contains apparent sheets or
+discontinuities. It reports unusually planar frame clouds, camera-pose jumps,
+and per-window alignment scales without changing the reconstruction.
+
 #### Running on Limited GPU Memory
 
 If you run into out-of-memory issues, try one (or both) of the following:

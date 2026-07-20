@@ -45,7 +45,10 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
-from lingbot_map.utils.geometry import closed_form_inverse_se3_general
+from lingbot_map.utils.geometry import (
+    closed_form_inverse_se3_general,
+    unproject_depth_map_to_point_map,
+)
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 
@@ -383,6 +386,74 @@ def validate_predictions(predictions, stage="inference"):
         )
 
 
+def diagnose_geometry(predictions, conf_threshold=1.5, sample_step=8):
+    """Print frame-level geometry anomalies without modifying predictions."""
+    depth = predictions.get("depth")
+    conf = predictions.get("depth_conf")
+    extrinsic = predictions.get("extrinsic")
+    intrinsic = predictions.get("intrinsic")
+    if any(value is None for value in (depth, conf, extrinsic, intrinsic)):
+        print("Geometry diagnostics skipped: depth/confidence/cameras unavailable")
+        return []
+
+    arrays = []
+    for value in (depth, conf, extrinsic, intrinsic):
+        arrays.append(value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value))
+    depth, conf, extrinsic, intrinsic = arrays
+    points = unproject_depth_map_to_point_map(depth, extrinsic, intrinsic)
+    centers = extrinsic[:, :3, 3]
+    pose_steps = np.r_[0.0, np.linalg.norm(np.diff(centers, axis=0), axis=1)]
+
+    rows = []
+    for frame in range(len(points)):
+        valid = np.isfinite(points[frame]).all(-1) & (conf[frame] > conf_threshold)
+        cloud = points[frame][::sample_step, ::sample_step][valid[::sample_step, ::sample_step]]
+        if len(cloud) < 16:
+            rows.append((frame, np.nan, np.nan, pose_steps[frame], len(cloud)))
+            continue
+        centered = cloud - np.median(cloud, axis=0)
+        covariance = centered.T @ centered / len(centered)
+        eigenvalues = np.maximum(np.linalg.eigvalsh(covariance), 0.0)
+        planarity = float(eigenvalues[0] / max(eigenvalues.sum(), 1e-12))
+        thickness = float(np.sqrt(eigenvalues[0]))
+        rows.append((frame, planarity, thickness, pose_steps[frame], len(cloud)))
+
+    finite_rows = [row for row in rows if np.isfinite(row[1])]
+    median_step = np.median([row[3] for row in finite_rows[1:]]) if len(finite_rows) > 1 else 0.0
+    ranked = sorted(
+        finite_rows,
+        key=lambda row: (row[1], -row[3]),
+    )[:10]
+    print("Geometry diagnostics (lowest PCA thickness ratio first):")
+    print("  frame  planar_ratio  thickness  pose_step  points")
+    for frame, planar, thickness, pose_step, count in ranked:
+        flags = []
+        if planar < 1e-4:
+            flags.append("SLAB")
+        if median_step > 0 and pose_step > 3 * median_step:
+            flags.append("POSE_JUMP")
+        print(
+            f"  {frame:5d}  {planar:12.6g}  {thickness:9.4g}  "
+            f"{pose_step:9.4g}  {count:6d}  {' '.join(flags)}"
+        )
+    print("Largest camera-pose steps:")
+    for frame, planar, thickness, pose_step, count in sorted(
+        finite_rows[1:], key=lambda row: row[3], reverse=True
+    )[:8]:
+        ratio = pose_step / median_step if median_step > 0 else np.nan
+        boundary = "WINDOW_EDGE" if frame % 4 == 0 else ""
+        print(f"  frame {frame:3d}: step={pose_step:.5g} ({ratio:.2f}x median) {boundary}")
+
+    chunk_scales = predictions.get("chunk_scales")
+    if chunk_scales is not None:
+        chunk_scales = (
+            chunk_scales.detach().cpu().numpy()
+            if torch.is_tensor(chunk_scales) else np.asarray(chunk_scales)
+        )
+        print(f"Window alignment scales: {np.array2string(chunk_scales.squeeze(), precision=4)}")
+    return rows
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -474,6 +545,8 @@ def main():
                         help="Save sky mask visualizations (original | mask | overlay) to this directory")
     parser.add_argument("--export_preprocessed", type=str, default=None,
                         help="Export stride-sampled, resized/cropped images to this folder")
+    parser.add_argument("--diagnose_geometry", action="store_true",
+                        help="Print frame-level slab and pose-jump diagnostics")
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
@@ -693,6 +766,8 @@ def main():
         images_for_post = images
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
+    if args.diagnose_geometry:
+        diagnose_geometry(predictions, conf_threshold=args.conf_threshold)
 
     # ── Visualize ────────────────────────────────────────────────────────────
     try:

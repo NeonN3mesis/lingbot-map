@@ -451,7 +451,141 @@ def diagnose_geometry(predictions, conf_threshold=1.5, sample_step=8):
             if torch.is_tensor(chunk_scales) else np.asarray(chunk_scales)
         )
         print(f"Window alignment scales: {np.array2string(chunk_scales.squeeze(), precision=4)}")
+
+    floor = estimate_floor_plane(points, conf, extrinsic, conf_threshold, sample_step)
+    if floor is not None:
+        normal, offset, inlier_ratio = floor
+        viewer_up = np.array([0.0, -1.0, 0.0])
+        if np.dot(normal, viewer_up) < 0:
+            normal = -normal
+            offset = -offset
+        tilt = np.degrees(np.arccos(np.clip(np.dot(normal, viewer_up), -1.0, 1.0)))
+        print(
+            f"Estimated floor: tilt={tilt:.2f}° from viewer up, "
+            f"inliers={100 * inlier_ratio:.1f}%, normal={np.array2string(normal, precision=4)}"
+        )
     return rows
+
+
+def estimate_floor_plane(points, conf, extrinsic, conf_threshold=1.5, sample_step=8):
+    """Robustly fit the dominant floor-like plane from lower-image points."""
+    height = points.shape[1]
+    candidates = points[:, int(height * 0.58):, ::sample_step]
+    candidate_conf = conf[:, int(height * 0.58):, ::sample_step]
+    valid = np.isfinite(candidates).all(-1) & (candidate_conf > conf_threshold)
+    candidates = candidates[valid]
+    if len(candidates) < 100:
+        return None
+    if len(candidates) > 100000:
+        indices = np.linspace(0, len(candidates) - 1, 100000).astype(np.int64)
+        candidates = candidates[indices]
+
+    expected_up = -extrinsic[0, :3, 1]
+    expected_up /= max(np.linalg.norm(expected_up), 1e-12)
+    trajectory_extent = np.linalg.norm(np.ptp(extrinsic[:, :3, 3], axis=0))
+    distance_threshold = max(trajectory_extent * 0.006, 0.01)
+    rng = np.random.default_rng(0)
+    best = None
+    for _ in range(600):
+        a, b, c = candidates[rng.choice(len(candidates), 3, replace=False)]
+        normal = np.cross(b - a, c - a)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-8:
+            continue
+        normal /= norm
+        alignment = abs(float(np.dot(normal, expected_up)))
+        if alignment < 0.6:
+            continue
+        offset = -float(np.dot(normal, a))
+        inliers = np.abs(candidates @ normal + offset) < distance_threshold
+        score = int(inliers.sum())
+        if best is None or score > best[0]:
+            best = (score, inliers)
+    if best is None or best[0] < 100:
+        return None
+
+    inlier_points = candidates[best[1]]
+    center = inlier_points.mean(0)
+    _, _, vh = np.linalg.svd(inlier_points - center, full_matrices=False)
+    normal = vh[-1]
+    if np.dot(normal, expected_up) < 0:
+        normal = -normal
+    offset = -float(np.dot(normal, center))
+    return normal, offset, best[0] / len(candidates)
+
+
+def rotation_between_vectors(source, target):
+    """Return a proper rotation matrix mapping one unit direction to another."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    source /= np.linalg.norm(source)
+    target /= np.linalg.norm(target)
+    cross = np.cross(source, target)
+    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    sine = np.linalg.norm(cross)
+    if sine < 1e-10:
+        if cosine > 0:
+            return np.eye(3)
+        axis = np.array([1.0, 0.0, 0.0])
+        if abs(source[0]) > 0.9:
+            axis = np.array([0.0, 1.0, 0.0])
+        axis -= source * np.dot(axis, source)
+        axis /= np.linalg.norm(axis)
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
+    axis = cross / sine
+    skew = np.array([
+        [0.0, -axis[2], axis[1]],
+        [axis[2], 0.0, -axis[0]],
+        [-axis[1], axis[0], 0.0],
+    ])
+    return np.eye(3) + sine * skew + (1.0 - cosine) * (skew @ skew)
+
+
+def level_predictions_to_floor(predictions, conf_threshold=1.5):
+    """Rigidly rotate reconstruction coordinates so the fitted floor is level."""
+    arrays = {}
+    for key in ("depth", "depth_conf", "extrinsic", "intrinsic"):
+        value = predictions.get(key)
+        if value is None:
+            return None
+        arrays[key] = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+    points = unproject_depth_map_to_point_map(
+        arrays["depth"], arrays["extrinsic"], arrays["intrinsic"]
+    )
+    floor = estimate_floor_plane(
+        points, arrays["depth_conf"], arrays["extrinsic"], conf_threshold
+    )
+    if floor is None:
+        return None
+    normal, _, inlier_ratio = floor
+    target_up = np.array([0.0, -1.0, 0.0])
+    if np.dot(normal, target_up) < 0:
+        normal = -normal
+    rotation = rotation_between_vectors(normal, target_up).astype(np.float32)
+
+    extrinsic = predictions["extrinsic"]
+    if torch.is_tensor(extrinsic):
+        rot = torch.as_tensor(rotation, device=extrinsic.device, dtype=extrinsic.dtype)
+        leveled = extrinsic.clone()
+        # Stored extrinsics are world-to-camera. For world' = Q @ world,
+        # camera = R @ Q.T @ world' + t, so translation is unchanged.
+        leveled[..., :3, :3] = torch.matmul(extrinsic[..., :3, :3], rot.T)
+    else:
+        leveled = np.asarray(extrinsic).copy()
+        leveled[..., :3, :3] = np.einsum("nij,jk->nik", leveled[..., :3, :3], rotation.T)
+    predictions["extrinsic"] = leveled
+
+    world_points = predictions.get("world_points")
+    if world_points is not None:
+        if torch.is_tensor(world_points):
+            rot = torch.as_tensor(rotation, device=world_points.device, dtype=world_points.dtype)
+            predictions["world_points"] = torch.matmul(world_points, rot.T)
+        else:
+            predictions["world_points"] = np.asarray(world_points) @ rotation.T
+
+    tilt = np.degrees(np.arccos(np.clip(np.dot(normal, target_up), -1.0, 1.0)))
+    print(f"Leveled reconstruction by {tilt:.2f}° using floor fit ({100 * inlier_ratio:.1f}% inliers)")
+    return rotation
 
 
 def parse_frame_spec(spec):
@@ -574,6 +708,10 @@ def main():
         "--exclude_point_frames", type=str, default="",
         help="Exclude frames from point-cloud display, but keep them in inference. "
              "Accepts comma-separated indices/ranges such as '3,8-10'.",
+    )
+    parser.add_argument(
+        "--level_floor", action="store_true",
+        help="Rigidly rotate reconstruction and cameras to make the fitted floor horizontal.",
     )
 
     args = parser.parse_args()
@@ -798,6 +936,9 @@ def main():
         images_for_post = images
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
+    if args.level_floor:
+        if level_predictions_to_floor(predictions, conf_threshold=args.conf_threshold) is None:
+            print("Floor leveling skipped: no reliable floor plane found")
     if args.diagnose_geometry:
         diagnose_geometry(predictions, conf_threshold=args.conf_threshold)
 

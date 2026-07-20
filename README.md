@@ -327,6 +327,12 @@ Once a bad depth frame is identified, `--exclude_point_frames 3,8-10` omits
 those frames from displayed geometry while preserving their inference context,
 camera poses, and source images.
 
+Monocular reconstruction has no gravity reference, so a level floor may appear
+sloped when the anchor camera is pitched. Pass `--level_floor` to robustly fit
+the dominant floor-like plane and rigidly rotate the reconstruction and camera
+poses until that plane is horizontal. This changes orientation only, not scale,
+distances, or scene shape.
+
 #### Running on Limited GPU Memory
 
 If you run into out-of-memory issues, try one (or both) of the following:

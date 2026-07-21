@@ -20,7 +20,11 @@ Usage:
 
 import argparse
 import glob
+import hashlib
+import json
 import os
+import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -317,6 +321,46 @@ def postprocess(predictions, images):
         torch.cuda.synchronize()
 
     return predictions, images_cpu
+
+
+def save_run_artifact(output_dir, predictions, images, paths, command):
+    """Persist unmodified reconstruction outputs and reproducibility metadata."""
+    os.makedirs(output_dir, exist_ok=True)
+    arrays = {}
+    for key in ("depth", "depth_conf", "extrinsic", "intrinsic", "pose_enc"):
+        value = predictions.get(key)
+        if value is not None:
+            arrays[key] = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+    image_array = images.detach().cpu().numpy() if torch.is_tensor(images) else np.asarray(images)
+    arrays["images_u8"] = (image_array * 255).clip(0, 255).astype(np.uint8)
+    np.savez_compressed(os.path.join(output_dir, "predictions.npz"), **arrays)
+
+    frames = []
+    for path in paths:
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        frames.append({"path": os.path.abspath(path), "sha256": digest.hexdigest()})
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+    metadata = {
+        "schema_version": 1,
+        "command": command,
+        "git_revision": revision,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torch_hip": torch.version.hip,
+        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "frames": frames,
+    }
+    with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as output:
+        json.dump(metadata, output, indent=2)
+    print(f"Saved benchmark artifact to {output_dir}")
 
 
 def prepare_for_visualization(predictions, images=None):
@@ -719,6 +763,14 @@ def main():
     parser.add_argument("--diagnose_geometry", action="store_true",
                         help="Print frame-level slab and pose-jump diagnostics")
     parser.add_argument(
+        "--save_run", type=str, default=None,
+        help="Save raw predictions, preprocessed images, and reproducibility metadata.",
+    )
+    parser.add_argument(
+        "--no_viewer", action="store_true",
+        help="Exit after inference/post-processing (useful for benchmark capture).",
+    )
+    parser.add_argument(
         "--exclude_point_frames", type=str, default="",
         help="Exclude frames from point-cloud display, but keep them in inference. "
              "Accepts comma-separated indices/ranges such as '3,8-10'.",
@@ -746,7 +798,6 @@ def main():
         parser.error(str(error))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     # The CUDA-shaped PyTorch API is also used by ROCm. FlashInfer is unavailable
     # there, so select SDPA and conservative input/viewer defaults. The model's
     # prediction-head workaround handles ROCm's corrupt single-frame DPT kernels.
@@ -941,11 +992,15 @@ def main():
         images_for_post = images
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
+    if args.save_run:
+        save_run_artifact(args.save_run, predictions, images_cpu, paths, sys.argv)
     if args.level_floor:
         if level_predictions_to_floor(predictions, conf_threshold=args.conf_threshold) is None:
             print("Floor leveling skipped: no reliable floor plane found")
     if args.diagnose_geometry:
         diagnose_geometry(predictions, conf_threshold=args.conf_threshold)
+    if args.no_viewer:
+        return
 
     # ── Visualize ────────────────────────────────────────────────────────────
     try:

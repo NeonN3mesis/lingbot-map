@@ -339,6 +339,12 @@ Once a bad depth frame is identified, `--exclude_point_frames 3,8-10` omits
 those frames from displayed geometry while preserving their inference context,
 camera poses, and source images.
 
+For controlled comparisons, see [BENCHMARK.md](BENCHMARK.md). `--save_run`
+captures raw reconstruction arrays and reproducibility metadata, while
+`benchmark.py` reports independent validity, roughness, adjacent-agreement, and
+manually scoped layer-thickness metrics. Repeated runs are required on ROCm;
+the tested stack has meaningful depth-output variance.
+
 Monocular reconstruction has no gravity reference, so a level floor may appear
 sloped when the anchor camera is pitched. Pass `--level_floor` to robustly fit
 the dominant floor-like plane and rigidly rotate the reconstruction and camera

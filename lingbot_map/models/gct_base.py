@@ -193,6 +193,16 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
 
         aggregated_tokens_list_fp32 = [t.float() for t in aggregated_tokens_list]
         images_fp32 = images.float()
+        # MIOpen's DPT convolution path is numerically corrupt for the
+        # single-frame (effective batch=1) shape on RDNA3. Repeating to the
+        # already-stable scale-batch size changes only head compute; identical
+        # samples are independent here, so slicing the first result is exact.
+        rocm_single_frame = torch.version.hip is not None and images_fp32.shape[1] == 1
+        if rocm_single_frame:
+            aggregated_tokens_list_fp32 = [
+                t.repeat(1, 8, 1, 1) for t in aggregated_tokens_list_fp32
+            ]
+            images_fp32 = images_fp32.repeat(1, 8, 1, 1, 1)
 
         with torch.amp.autocast('cuda', enabled=False):
             depth, depth_conf = self.depth_head(
@@ -200,6 +210,10 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
                 images=images_fp32,
                 patch_start_idx=patch_start_idx
             )
+
+        if rocm_single_frame:
+            depth = depth[:, :1]
+            depth_conf = depth_conf[:, :1]
 
         return {"depth": depth, "depth_conf": depth_conf}
 
@@ -215,6 +229,13 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
 
         aggregated_tokens_list_fp32 = [t.float() for t in aggregated_tokens_list]
         images_fp32 = images.float()
+        # See the depth-head workaround above; this is the same DPT backbone.
+        rocm_single_frame = torch.version.hip is not None and images_fp32.shape[1] == 1
+        if rocm_single_frame:
+            aggregated_tokens_list_fp32 = [
+                t.repeat(1, 8, 1, 1) for t in aggregated_tokens_list_fp32
+            ]
+            images_fp32 = images_fp32.repeat(1, 8, 1, 1, 1)
 
         with torch.amp.autocast('cuda', enabled=False):
             pts3d, pts3d_conf = self.point_head(
@@ -222,6 +243,9 @@ class GCTBase(nn.Module, PyTorchModelHubMixin, ABC):
                 images=images_fp32,
                 patch_start_idx=patch_start_idx
             )
+        if rocm_single_frame:
+            pts3d = pts3d[:, :1]
+            pts3d_conf = pts3d_conf[:, :1]
 
         return {"world_points": pts3d, "world_points_conf": pts3d_conf}
 

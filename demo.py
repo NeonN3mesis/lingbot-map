@@ -20,7 +20,11 @@ Usage:
 
 import argparse
 import glob
+import hashlib
+import json
 import os
+import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -45,7 +49,10 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
-from lingbot_map.utils.geometry import closed_form_inverse_se3_general
+from lingbot_map.utils.geometry import (
+    closed_form_inverse_se3_general,
+    unproject_depth_map_to_point_map,
+)
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 
@@ -55,7 +62,7 @@ from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png,.JPG",
                 first_k=None, stride=1, image_size=518, patch_size=14, num_workers=8,
-                rotate_clockwise_90=False):
+                rotate_clockwise_90=False, max_image_height=None):
     """Load images from folder or video and preprocess into a tensor.
 
     Returns:
@@ -92,7 +99,10 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
         paths = []
         for ext in exts:
             paths.extend(glob.glob(os.path.join(image_folder, f"*{ext}")))
-        paths = sorted(paths)
+        # A case-insensitive filesystem can return the same file for both
+        # ``*.jpg`` and ``*.JPG``. Duplicate adjacent frames erase parallax and
+        # noticeably degrade reconstruction, so dedupe by normalized path.
+        paths = sorted({os.path.normcase(os.path.abspath(path)): path for path in paths}.values())
         resolved_folder = image_folder
 
     if first_k is not None and first_k > 0:
@@ -119,6 +129,15 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
         image_size=image_size,
         patch_size=patch_size,
     )
+    if max_image_height is not None and images.shape[-2] > max_image_height:
+        original_height = images.shape[-2]
+        target_height = max(patch_size, (max_image_height // patch_size) * patch_size)
+        start = (images.shape[-2] - target_height) // 2
+        images = images[..., start:start + target_height, :]
+        print(
+            f"Center-cropped preprocessed height from {original_height} "
+            f"to {target_height} for backend stability"
+        )
     h, w = images.shape[-2:]
     print(f"Preprocessed images to {w}x{h} using canonical crop mode")
     return images, paths, resolved_folder
@@ -304,6 +323,46 @@ def postprocess(predictions, images):
     return predictions, images_cpu
 
 
+def save_run_artifact(output_dir, predictions, images, paths, command):
+    """Persist unmodified reconstruction outputs and reproducibility metadata."""
+    os.makedirs(output_dir, exist_ok=True)
+    arrays = {}
+    for key in ("depth", "depth_conf", "extrinsic", "intrinsic", "pose_enc"):
+        value = predictions.get(key)
+        if value is not None:
+            arrays[key] = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+    image_array = images.detach().cpu().numpy() if torch.is_tensor(images) else np.asarray(images)
+    arrays["images_u8"] = (image_array * 255).clip(0, 255).astype(np.uint8)
+    np.savez_compressed(os.path.join(output_dir, "predictions.npz"), **arrays)
+
+    frames = []
+    for path in paths:
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        frames.append({"path": os.path.abspath(path), "sha256": digest.hexdigest()})
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+    metadata = {
+        "schema_version": 1,
+        "command": command,
+        "git_revision": revision,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torch_hip": torch.version.hip,
+        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "frames": frames,
+    }
+    with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as output:
+        json.dump(metadata, output, indent=2)
+    print(f"Saved benchmark artifact to {output_dir}")
+
+
 def prepare_for_visualization(predictions, images=None):
     """Convert predictions to the unbatched NumPy format used by vis code."""
     vis_predictions = {}
@@ -335,6 +394,276 @@ def prepare_for_visualization(predictions, images=None):
     return vis_predictions
 
 
+def validate_predictions(predictions, stage="inference"):
+    """Reject numerically corrupt reconstructions before opening the viewer."""
+    required = ("pose_enc", "depth", "depth_conf")
+    problems = []
+
+    for key in required:
+        value = predictions.get(key)
+        if not isinstance(value, torch.Tensor):
+            problems.append(f"missing tensor {key!r}")
+            continue
+
+        finite = torch.isfinite(value)
+        if finite.all():
+            continue
+
+        # Model outputs are [B, S, ...] before post-processing and [S, ...]
+        # afterwards. Report the first affected frame in either representation.
+        frame_dim = 1 if value.ndim == _BATCHED_NDIMS.get(key) else 0
+        reduce_dims = tuple(i for i in range(value.ndim) if i != frame_dim)
+        frame_ok = finite.all(dim=reduce_dims)
+        bad_frames = (~frame_ok).nonzero(as_tuple=False).flatten().tolist()
+        finite_pct = 100.0 * finite.float().mean().item()
+        problems.append(
+            f"{key} is {finite_pct:.2f}% finite; first bad frame={bad_frames[0]}"
+        )
+
+    depth = predictions.get("depth")
+    if isinstance(depth, torch.Tensor) and torch.isfinite(depth).any():
+        finite_depth = depth[torch.isfinite(depth)]
+        positive_pct = 100.0 * (finite_depth > 0).float().mean().item()
+        if positive_pct < 99.0:
+            problems.append(f"depth is only {positive_pct:.2f}% positive")
+
+    if problems:
+        hint = ""
+        if torch.version.hip is not None:
+            hint = (
+                " On AMD/ROCm, keep the validated 518x294 input shape; if the "
+                "failure persists, try --mode windowed to reset model state."
+            )
+        raise RuntimeError(
+            f"Invalid reconstruction after {stage}: " + "; ".join(problems) + "." + hint
+        )
+
+
+def diagnose_geometry(predictions, conf_threshold=1.5, sample_step=8):
+    """Print frame-level geometry anomalies without modifying predictions."""
+    depth = predictions.get("depth")
+    conf = predictions.get("depth_conf")
+    extrinsic = predictions.get("extrinsic")
+    intrinsic = predictions.get("intrinsic")
+    if any(value is None for value in (depth, conf, extrinsic, intrinsic)):
+        print("Geometry diagnostics skipped: depth/confidence/cameras unavailable")
+        return []
+
+    arrays = []
+    for value in (depth, conf, extrinsic, intrinsic):
+        arrays.append(value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value))
+    depth, conf, extrinsic, intrinsic = arrays
+    points = unproject_depth_map_to_point_map(depth, extrinsic, intrinsic)
+    centers = extrinsic[:, :3, 3]
+    pose_steps = np.r_[0.0, np.linalg.norm(np.diff(centers, axis=0), axis=1)]
+
+    rows = []
+    for frame in range(len(points)):
+        valid = np.isfinite(points[frame]).all(-1) & (conf[frame] > conf_threshold)
+        cloud = points[frame][::sample_step, ::sample_step][valid[::sample_step, ::sample_step]]
+        if len(cloud) < 16:
+            rows.append((frame, np.nan, np.nan, pose_steps[frame], len(cloud)))
+            continue
+        centered = cloud - np.median(cloud, axis=0)
+        covariance = centered.T @ centered / len(centered)
+        eigenvalues = np.maximum(np.linalg.eigvalsh(covariance), 0.0)
+        planarity = float(eigenvalues[0] / max(eigenvalues.sum(), 1e-12))
+        thickness = float(np.sqrt(eigenvalues[0]))
+        rows.append((frame, planarity, thickness, pose_steps[frame], len(cloud)))
+
+    finite_rows = [row for row in rows if np.isfinite(row[1])]
+    median_step = np.median([row[3] for row in finite_rows[1:]]) if len(finite_rows) > 1 else 0.0
+    ranked = sorted(
+        finite_rows,
+        key=lambda row: (row[1], -row[3]),
+    )[:10]
+    print("Geometry diagnostics (lowest PCA thickness ratio first):")
+    print("  frame  planar_ratio  thickness  pose_step  points")
+    for frame, planar, thickness, pose_step, count in ranked:
+        flags = []
+        if planar < 1e-4:
+            flags.append("SLAB")
+        if median_step > 0 and pose_step > 3 * median_step:
+            flags.append("POSE_JUMP")
+        print(
+            f"  {frame:5d}  {planar:12.6g}  {thickness:9.4g}  "
+            f"{pose_step:9.4g}  {count:6d}  {' '.join(flags)}"
+        )
+    print("Largest camera-pose steps:")
+    for frame, planar, thickness, pose_step, count in sorted(
+        finite_rows[1:], key=lambda row: row[3], reverse=True
+    )[:8]:
+        ratio = pose_step / median_step if median_step > 0 else np.nan
+        boundary = "WINDOW_EDGE" if frame % 4 == 0 else ""
+        print(f"  frame {frame:3d}: step={pose_step:.5g} ({ratio:.2f}x median) {boundary}")
+
+    chunk_scales = predictions.get("chunk_scales")
+    if chunk_scales is not None:
+        chunk_scales = (
+            chunk_scales.detach().cpu().numpy()
+            if torch.is_tensor(chunk_scales) else np.asarray(chunk_scales)
+        )
+        print(f"Window alignment scales: {np.array2string(chunk_scales.squeeze(), precision=4)}")
+
+    floor = estimate_floor_plane(points, conf, extrinsic, conf_threshold, sample_step)
+    if floor is not None:
+        normal, offset, inlier_ratio = floor
+        viewer_up = np.array([0.0, -1.0, 0.0])
+        if np.dot(normal, viewer_up) < 0:
+            normal = -normal
+            offset = -offset
+        tilt = np.degrees(np.arccos(np.clip(np.dot(normal, viewer_up), -1.0, 1.0)))
+        print(
+            f"Estimated floor: tilt={tilt:.2f}° from viewer up, "
+            f"inliers={100 * inlier_ratio:.1f}%, normal={np.array2string(normal, precision=4)}"
+        )
+    return rows
+
+
+def estimate_floor_plane(points, conf, extrinsic, conf_threshold=1.5, sample_step=8):
+    """Robustly fit the dominant floor-like plane from lower-image points."""
+    height = points.shape[1]
+    candidates = points[:, int(height * 0.58):, ::sample_step]
+    candidate_conf = conf[:, int(height * 0.58):, ::sample_step]
+    valid = np.isfinite(candidates).all(-1) & (candidate_conf > conf_threshold)
+    candidates = candidates[valid]
+    if len(candidates) < 100:
+        return None
+    if len(candidates) > 100000:
+        indices = np.linspace(0, len(candidates) - 1, 100000).astype(np.int64)
+        candidates = candidates[indices]
+
+    expected_up = -extrinsic[0, :3, 1]
+    expected_up /= max(np.linalg.norm(expected_up), 1e-12)
+    trajectory_extent = np.linalg.norm(np.ptp(extrinsic[:, :3, 3], axis=0))
+    distance_threshold = max(trajectory_extent * 0.006, 0.01)
+    rng = np.random.default_rng(0)
+    best = None
+    for _ in range(600):
+        a, b, c = candidates[rng.choice(len(candidates), 3, replace=False)]
+        normal = np.cross(b - a, c - a)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-8:
+            continue
+        normal /= norm
+        alignment = abs(float(np.dot(normal, expected_up)))
+        if alignment < 0.6:
+            continue
+        offset = -float(np.dot(normal, a))
+        inliers = np.abs(candidates @ normal + offset) < distance_threshold
+        score = int(inliers.sum())
+        if best is None or score > best[0]:
+            best = (score, inliers)
+    if best is None or best[0] < 100:
+        return None
+
+    inlier_points = candidates[best[1]]
+    center = inlier_points.mean(0)
+    _, _, vh = np.linalg.svd(inlier_points - center, full_matrices=False)
+    normal = vh[-1]
+    if np.dot(normal, expected_up) < 0:
+        normal = -normal
+    offset = -float(np.dot(normal, center))
+    return normal, offset, best[0] / len(candidates)
+
+
+def rotation_between_vectors(source, target):
+    """Return a proper rotation matrix mapping one unit direction to another."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    source /= np.linalg.norm(source)
+    target /= np.linalg.norm(target)
+    cross = np.cross(source, target)
+    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    sine = np.linalg.norm(cross)
+    if sine < 1e-10:
+        if cosine > 0:
+            return np.eye(3)
+        axis = np.array([1.0, 0.0, 0.0])
+        if abs(source[0]) > 0.9:
+            axis = np.array([0.0, 1.0, 0.0])
+        axis -= source * np.dot(axis, source)
+        axis /= np.linalg.norm(axis)
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
+    axis = cross / sine
+    skew = np.array([
+        [0.0, -axis[2], axis[1]],
+        [axis[2], 0.0, -axis[0]],
+        [-axis[1], axis[0], 0.0],
+    ])
+    return np.eye(3) + sine * skew + (1.0 - cosine) * (skew @ skew)
+
+
+def level_predictions_to_floor(predictions, conf_threshold=1.5):
+    """Rigidly rotate reconstruction coordinates so the fitted floor is level."""
+    arrays = {}
+    for key in ("depth", "depth_conf", "extrinsic", "intrinsic"):
+        value = predictions.get(key)
+        if value is None:
+            return None
+        arrays[key] = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+    points = unproject_depth_map_to_point_map(
+        arrays["depth"], arrays["extrinsic"], arrays["intrinsic"]
+    )
+    floor = estimate_floor_plane(
+        points, arrays["depth_conf"], arrays["extrinsic"], conf_threshold
+    )
+    if floor is None:
+        return None
+    normal, _, inlier_ratio = floor
+    target_up = np.array([0.0, -1.0, 0.0])
+    if np.dot(normal, target_up) < 0:
+        normal = -normal
+    rotation = rotation_between_vectors(normal, target_up).astype(np.float32)
+
+    extrinsic = predictions["extrinsic"]
+    if torch.is_tensor(extrinsic):
+        rot = torch.as_tensor(rotation, device=extrinsic.device, dtype=extrinsic.dtype)
+        leveled = extrinsic.clone()
+        # Stored extrinsics are world-to-camera. For world' = Q @ world,
+        # camera = R @ Q.T @ world' + t, so translation is unchanged.
+        leveled[..., :3, :3] = torch.matmul(extrinsic[..., :3, :3], rot.T)
+    else:
+        leveled = np.asarray(extrinsic).copy()
+        leveled[..., :3, :3] = np.einsum("nij,jk->nik", leveled[..., :3, :3], rotation.T)
+    predictions["extrinsic"] = leveled
+
+    world_points = predictions.get("world_points")
+    if world_points is not None:
+        if torch.is_tensor(world_points):
+            rot = torch.as_tensor(rotation, device=world_points.device, dtype=world_points.dtype)
+            predictions["world_points"] = torch.matmul(world_points, rot.T)
+        else:
+            predictions["world_points"] = np.asarray(world_points) @ rotation.T
+
+    tilt = np.degrees(np.arccos(np.clip(np.dot(normal, target_up), -1.0, 1.0)))
+    print(f"Leveled reconstruction by {tilt:.2f}° using floor fit ({100 * inlier_ratio:.1f}% inliers)")
+    return rotation
+
+
+def parse_frame_spec(spec):
+    """Parse comma-separated frame numbers and inclusive ranges."""
+    frames = set()
+    if not spec:
+        return frames
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if start < 0 or end < start:
+                raise ValueError(f"invalid frame range: {token!r}")
+            frames.update(range(start, end + 1))
+        else:
+            frame = int(token)
+            if frame < 0:
+                raise ValueError(f"invalid frame number: {token!r}")
+            frames.add(frame)
+    return frames
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -356,6 +685,11 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--image_size", type=int, default=518)
     parser.add_argument("--patch_size", type=int, default=14)
+    parser.add_argument(
+        "--max_image_height", type=int, default=None,
+        help="Center-crop preprocessed images to this maximum patch-aligned height "
+             "(ROCm preset: 294).",
+    )
 
     # Inference mode
     parser.add_argument("--mode", type=str, default="streaming", choices=["streaming", "windowed"],
@@ -406,6 +740,19 @@ def main():
     parser.add_argument("--conf_threshold", type=float, default=1.5)
     parser.add_argument("--downsample_factor", type=int, default=10)
     parser.add_argument("--point_size", type=float, default=0.00001)
+    parser.add_argument(
+        "--depth_edge_threshold", type=float, default=None,
+        help="Remove points beside relative depth jumps larger than this ratio; "
+             "0 disables it (AMD inspection preset: 0.15).",
+    )
+    parser.add_argument(
+        "--show_camera", action=argparse.BooleanOptionalAction, default=None,
+        help="Show camera frustums in the viewer (AMD inspection preset: off).",
+    )
+    parser.add_argument(
+        "--allow_unsafe_rocm_streaming", action="store_true", default=False,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
     parser.add_argument("--sky_mask_dir", type=str, default=None,
                         help="Directory for cached sky masks (default: <image_folder>_sky_masks/)")
@@ -413,12 +760,76 @@ def main():
                         help="Save sky mask visualizations (original | mask | overlay) to this directory")
     parser.add_argument("--export_preprocessed", type=str, default=None,
                         help="Export stride-sampled, resized/cropped images to this folder")
+    parser.add_argument("--diagnose_geometry", action="store_true",
+                        help="Print frame-level slab and pose-jump diagnostics")
+    parser.add_argument(
+        "--save_run", type=str, default=None,
+        help="Save raw predictions, preprocessed images, and reproducibility metadata.",
+    )
+    parser.add_argument(
+        "--no_viewer", action="store_true",
+        help="Exit after inference/post-processing (useful for benchmark capture).",
+    )
+    parser.add_argument(
+        "--exclude_point_frames", type=str, default="",
+        help="Exclude frames from point-cloud display, but keep them in inference. "
+             "Accepts comma-separated indices/ranges such as '3,8-10'.",
+    )
+    parser.add_argument(
+        "--level_floor", action="store_true",
+        help="Rigidly rotate reconstruction and cameras to make the fitted floor horizontal.",
+    )
+    parser.add_argument("--voxel_fusion", action="store_true",
+                        help="Fuse voxels supported by multiple frames for cleaner surfaces.")
+    parser.add_argument("--voxel_size", type=float, default=0.0,
+                        help="World-space voxel size; 0 chooses from camera trajectory extent.")
+    parser.add_argument("--min_view_support", type=int, default=0,
+                        help="Distinct frames required to retain a fused voxel; "
+                             "0 adaptively chooses one or two (default).")
+    parser.add_argument("--fusion_pixel_stride", type=int, default=2,
+                        help="Pixel stride used to build the fused cloud.")
 
     args = parser.parse_args()
     assert args.image_folder or args.video_path, \
         "Provide --image_folder or --video_path"
+    try:
+        args.exclude_point_frames = parse_frame_spec(args.exclude_point_frames)
+    except ValueError as error:
+        parser.error(str(error))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # The CUDA-shaped PyTorch API is also used by ROCm. FlashInfer is unavailable
+    # there, so select SDPA and conservative input/viewer defaults. The model's
+    # prediction-head workaround handles ROCm's corrupt single-frame DPT kernels.
+    is_rocm = torch.version.hip is not None
+    if is_rocm:
+        args.use_sdpa = True
+        if "--conf_threshold" not in sys.argv:
+            args.conf_threshold = 1.5
+        if "--downsample_factor" not in sys.argv:
+            args.downsample_factor = 2
+        if "--point_size" not in sys.argv:
+            args.point_size = 0.001
+        if args.depth_edge_threshold is None:
+            args.depth_edge_threshold = 0.15
+        if args.max_image_height is None:
+            args.max_image_height = 294
+        if args.show_camera is None:
+            args.show_camera = False
+        print(
+            "ROCm preset: SDPA + "
+            f"{args.mode} mode"
+            + (f" (window={args.window_size}, overlap={args.overlap_size})" if args.mode == "windowed" else "")
+        )
+    elif args.show_camera is None:
+        args.show_camera = True
+    if args.depth_edge_threshold is None:
+        args.depth_edge_threshold = 0.0
+    if args.voxel_fusion:
+        if "--downsample_factor" not in sys.argv:
+            args.downsample_factor = 1
+        if "--point_size" not in sys.argv:
+            args.point_size = 0.002
 
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
@@ -427,6 +838,7 @@ def main():
         fps=args.fps, first_k=args.first_k, stride=args.stride,
         image_size=args.image_size, patch_size=args.patch_size,
         rotate_clockwise_90=args.rotate_clockwise_90,
+        max_image_height=args.max_image_height,
     )
 
     # Export preprocessed images if requested
@@ -562,6 +974,7 @@ def main():
             )
 
     print(f"Inference done in {time.time() - t0:.1f}s")
+    validate_predictions(predictions)
     if torch.cuda.is_available():
         print(
             f"GPU peak during inference: "
@@ -579,6 +992,15 @@ def main():
         images_for_post = images
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
+    if args.save_run:
+        save_run_artifact(args.save_run, predictions, images_cpu, paths, sys.argv)
+    if args.level_floor:
+        if level_predictions_to_floor(predictions, conf_threshold=args.conf_threshold) is None:
+            print("Floor leveling skipped: no reliable floor plane found")
+    if args.diagnose_geometry:
+        diagnose_geometry(predictions, conf_threshold=args.conf_threshold)
+    if args.no_viewer:
+        return
 
     # ── Visualize ────────────────────────────────────────────────────────────
     try:
@@ -589,10 +1011,17 @@ def main():
             vis_threshold=args.conf_threshold,
             downsample_factor=args.downsample_factor,
             point_size=args.point_size,
+            show_camera=args.show_camera,
             mask_sky=args.mask_sky,
             image_folder=resolved_image_folder,
             sky_mask_dir=args.sky_mask_dir,
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
+            depth_edge_threshold=args.depth_edge_threshold,
+            excluded_frames=args.exclude_point_frames,
+            voxel_fusion=args.voxel_fusion,
+            voxel_size=args.voxel_size,
+            min_view_support=args.min_view_support,
+            fusion_pixel_stride=args.fusion_pixel_stride,
         )
         print(f"3D viewer at http://localhost:{args.port}")
         viewer.run()

@@ -92,6 +92,12 @@ class PointCloudViewer:
         sky_mask_dir: Optional[str] = None,
         sky_mask_visualization_dir: Optional[str] = None,
         depth_stride: int = 1,
+        depth_edge_threshold: float = 0.0,
+        excluded_frames: Optional[set] = None,
+        voxel_fusion: bool = False,
+        voxel_size: float = 0.0,
+        min_view_support: int = 0,
+        fusion_pixel_stride: int = 2,
     ):
         self.model = model
         self.size = size
@@ -102,6 +108,7 @@ class PointCloudViewer:
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
         self.point_size = point_size
+        self.downsample_factor = downsample_factor
         self.tt = lambda x: torch.from_numpy(x).float().to(device)
 
         # Process the prediction dictionary to create pc_list, color_list, conf_list
@@ -111,6 +118,12 @@ class PointCloudViewer:
                 sky_mask_dir=sky_mask_dir,
                 sky_mask_visualization_dir=sky_mask_visualization_dir,
                 depth_stride=depth_stride,
+                depth_edge_threshold=depth_edge_threshold,
+                excluded_frames=excluded_frames,
+                voxel_fusion=voxel_fusion,
+                voxel_size=voxel_size,
+                min_view_support=min_view_support,
+                fusion_pixel_stride=fusion_pixel_stride,
             )
         else:
             self.original_images = []
@@ -140,6 +153,12 @@ class PointCloudViewer:
         sky_mask_dir: Optional[str] = None,
         sky_mask_visualization_dir: Optional[str] = None,
         depth_stride: int = 1,
+        depth_edge_threshold: float = 0.0,
+        excluded_frames: Optional[set] = None,
+        voxel_fusion: bool = False,
+        voxel_size: float = 0.0,
+        min_view_support: int = 0,
+        fusion_pixel_stride: int = 2,
     ) -> Tuple[List, List, List, Dict]:
         """Process prediction dictionary to extract visualization data.
 
@@ -153,6 +172,15 @@ class PointCloudViewer:
             depth_stride: Only project depth to point cloud every N frames.
                 Frames not projected will have empty point clouds but still
                 show camera frustums and images. 1 = every frame (default).
+            depth_edge_threshold: Reject pixels whose relative depth jump to
+                a direct neighbour exceeds this ratio. 0 disables filtering.
+            excluded_frames: Frame indices omitted from point-cloud display.
+                Their camera poses and images remain available.
+            voxel_fusion: Fuse agreeing observations into one point per voxel.
+            voxel_size: World-space voxel edge length; 0 selects from trajectory scale.
+            min_view_support: Distinct frames required to retain a voxel. 0
+                selects two views when consensus coverage is healthy, else one.
+            fusion_pixel_stride: Input pixel stride used while building voxels.
         """
         images = pred_dict["images"]  # (S, 3, H, W)
 
@@ -170,6 +198,17 @@ class PointCloudViewer:
             world_points = pred_dict["world_points"]  # (S, H, W, 3)
             conf = pred_dict.get("world_points_conf", depth_conf)  # (S, H, W)
 
+        if depth_edge_threshold > 0 and depth_map is not None:
+            edge_mask = self.depth_continuity_mask(depth_map[..., 0], depth_edge_threshold)
+            conf = np.asarray(conf).copy() if conf is not None else edge_mask.astype(np.float32)
+            conf[~edge_mask] = 0.0
+            rejected = int((~edge_mask).sum())
+            total = int(edge_mask.size)
+            print(
+                f"  depth-edge filter={depth_edge_threshold:g}: "
+                f"rejected {rejected:,}/{total:,} pixels ({100 * rejected / max(total, 1):.1f}%)"
+            )
+
         # Apply sky segmentation if enabled
         if mask_sky:
             conf = apply_sky_segmentation(
@@ -181,6 +220,28 @@ class PointCloudViewer:
         # Convert images from (S, 3, H, W) to (S, H, W, 3)
         colors = images.transpose(0, 2, 3, 1)  # now (S, H, W, 3)
         S = world_points.shape[0]
+        cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)
+        excluded_frames = set(excluded_frames or ())
+
+        if voxel_fusion:
+            camera_positions = cam_to_world_mat[:, :3, 3]
+            trajectory_extent = float(np.linalg.norm(np.ptp(camera_positions, axis=0)))
+            # A ~1/430 trajectory ratio preserved useful corridor detail in the
+            # real AMD test while still merging repeated depth sheets.
+            effective_voxel_size = voxel_size if voxel_size > 0 else max(trajectory_extent / 430.0, 0.005)
+            world_points, colors, conf = self.fuse_multiview_voxels(
+                world_points, colors, conf,
+                conf_threshold=self.vis_threshold,
+                voxel_size=effective_voxel_size,
+                min_view_support=min_view_support,
+                pixel_stride=fusion_pixel_stride,
+                excluded_frames=excluded_frames,
+            )
+            print(
+                f"  voxel fusion: size={effective_voxel_size:.5g}, "
+                f"support={'adaptive' if min_view_support == 0 else str(min_view_support) + ' frames'}, "
+                f"input_stride={fusion_pixel_stride}"
+            )
 
         # Store original images for camera frustum display
         self.original_images = []
@@ -190,13 +251,12 @@ class PointCloudViewer:
             self.original_images.append(img)
 
         # Create lists - apply depth_stride to skip frames for point projection
-        H, W = world_points.shape[1], world_points.shape[2]
         pc_list = []
         color_list = []
         conf_list = []
         skipped = 0
         for i in range(S):
-            if depth_stride > 1 and i % depth_stride != 0:
+            if i in excluded_frames or (depth_stride > 1 and i % depth_stride != 0):
                 # Empty point cloud for skipped frames
                 pc_list.append(np.zeros((0, 0, 3), dtype=np.float32))
                 color_list.append(np.zeros((0, 0, 3), dtype=np.float32))
@@ -208,13 +268,15 @@ class PointCloudViewer:
                 if conf is not None:
                     conf_list.append(conf[i])
                 else:
-                    conf_list.append(np.ones(world_points[i].shape[:2], dtype=np.float32))
+                    conf_list.append(np.ones(world_points[i].shape[:-1], dtype=np.float32))
 
         if depth_stride > 1:
             print(f'  depth_stride={depth_stride}: projecting {S - skipped}/{S} frames, skipping {skipped}')
+        if excluded_frames:
+            shown = sorted(frame for frame in excluded_frames if 0 <= frame < S)
+            print(f"  excluded point-cloud frames: {shown}")
 
         # Create camera dictionary (all frames keep cameras)
-        cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)
         cam_dict = {
             "focal": [intrinsics_cam[i, 0, 0] for i in range(S)],
             "pp": [(intrinsics_cam[i, 0, 2], intrinsics_cam[i, 1, 2]) for i in range(S)],
@@ -223,6 +285,116 @@ class PointCloudViewer:
         }
 
         return pc_list, color_list, conf_list, cam_dict
+
+    @staticmethod
+    def fuse_multiview_voxels(
+        world_points: np.ndarray,
+        colors: np.ndarray,
+        conf: np.ndarray,
+        conf_threshold: float,
+        voxel_size: float,
+        min_view_support: int = 2,
+        pixel_stride: int = 2,
+        excluded_frames: Optional[set] = None,
+    ):
+        """Fuse points into voxels supported by distinct source frames."""
+        if voxel_size <= 0:
+            raise ValueError("voxel_size must be positive")
+        if min_view_support < 0:
+            raise ValueError("min_view_support must be non-negative")
+        excluded_frames = set(excluded_frames or ())
+        points_parts, color_parts, frame_parts = [], [], []
+        frame_count = len(world_points)
+        for frame in range(frame_count):
+            if frame in excluded_frames:
+                continue
+            points = np.asarray(world_points[frame])[::pixel_stride, ::pixel_stride].reshape(-1, 3)
+            point_colors = np.asarray(colors[frame])[::pixel_stride, ::pixel_stride].reshape(-1, 3)
+            confidence = np.asarray(conf[frame])[::pixel_stride, ::pixel_stride].reshape(-1)
+            valid = (
+                np.isfinite(points).all(1)
+                & np.isfinite(confidence)
+                & (confidence > conf_threshold)
+            )
+            points_parts.append(points[valid].astype(np.float32, copy=False))
+            color_parts.append(point_colors[valid].astype(np.float32, copy=False))
+            frame_parts.append(np.full(int(valid.sum()), frame, dtype=np.int32))
+        if not points_parts:
+            empty = [np.empty((0, 3), dtype=np.float32) for _ in range(frame_count)]
+            return empty, [x.copy() for x in empty], [np.empty((0,), dtype=np.float32) for _ in range(frame_count)]
+
+        points = np.concatenate(points_parts)
+        point_colors = np.concatenate(color_parts)
+        frame_ids = np.concatenate(frame_parts)
+        voxel_coords = np.floor(points / voxel_size).astype(np.int32)
+        _, inverse, counts = np.unique(
+            voxel_coords, axis=0, return_inverse=True, return_counts=True
+        )
+        voxel_count = len(counts)
+        pair_ids = inverse.astype(np.int64) * frame_count + frame_ids
+        unique_pairs = np.unique(pair_ids)
+        support = np.bincount(unique_pairs // frame_count, minlength=voxel_count)
+        if min_view_support == 0:
+            two_view_coverage = float(np.mean(support >= 2))
+            effective_support = 2 if two_view_coverage >= 0.35 else 1
+            print(
+                f"  adaptive voxel support: two-view coverage={100 * two_view_coverage:.1f}% "
+                f"-> require {effective_support} frame{'s' if effective_support != 1 else ''}"
+            )
+        else:
+            effective_support = min_view_support
+        keep_voxel = support >= effective_support
+
+        sums = np.stack([
+            np.bincount(inverse, weights=points[:, axis], minlength=voxel_count)
+            for axis in range(3)
+        ], axis=1)
+        color_sums = np.stack([
+            np.bincount(inverse, weights=point_colors[:, axis], minlength=voxel_count)
+            for axis in range(3)
+        ], axis=1)
+        frame_sums = np.bincount(inverse, weights=frame_ids, minlength=voxel_count)
+        fused_points = (sums / counts[:, None])[keep_voxel].astype(np.float32)
+        fused_colors = (color_sums / counts[:, None])[keep_voxel].astype(np.float32)
+        assigned_frames = np.rint(frame_sums / counts).astype(np.int32)[keep_voxel]
+
+        point_lists, color_lists, conf_lists = [], [], []
+        kept_support = support[keep_voxel].astype(np.float32)
+        for frame in range(frame_count):
+            select = assigned_frames == frame
+            point_lists.append(fused_points[select])
+            color_lists.append(fused_colors[select])
+            conf_lists.append(kept_support[select] + conf_threshold)
+        print(
+            f"  voxel consensus: {len(points):,} samples -> {voxel_count:,} occupied -> "
+            f"{len(fused_points):,} supported voxels "
+            f"({100 * len(fused_points) / max(voxel_count, 1):.1f}% retained)"
+        )
+        return point_lists, color_lists, conf_lists
+
+    @staticmethod
+    def depth_continuity_mask(depth: np.ndarray, threshold: float) -> np.ndarray:
+        """Return pixels not adjacent to a large relative depth discontinuity.
+
+        Comparing against the nearer of the two depths makes the threshold
+        scale-independent. Invalid and non-positive depths are always rejected.
+        """
+        depth = np.asarray(depth, dtype=np.float32)
+        valid = np.isfinite(depth) & (depth > 0)
+        keep = valid.copy()
+        eps = np.finfo(np.float32).eps
+        for axis in (-2, -1):
+            left = [slice(None)] * depth.ndim
+            right = [slice(None)] * depth.ndim
+            left[axis] = slice(None, -1)
+            right[axis] = slice(1, None)
+            a, b = depth[tuple(left)], depth[tuple(right)]
+            pair_valid = valid[tuple(left)] & valid[tuple(right)]
+            relative_jump = np.abs(a - b) / np.maximum(np.minimum(a, b), eps)
+            smooth = pair_valid & (relative_jump <= threshold)
+            keep[tuple(left)] &= smooth
+            keep[tuple(right)] &= smooth
+        return keep
 
     def _compute_scene_center_and_scale(self) -> Tuple[np.ndarray, float]:
         """Compute scene center and scale from camera positions and point clouds.
@@ -304,17 +476,17 @@ class PointCloudViewer:
             )
 
         # Video frame display controls — kept at top so the current frame is always visible
-        with self.server.gui.add_folder("Video Display"):
+        with self.server.gui.add_folder("Video Display", expand_by_default=False):
             self.show_video_checkbox = self.server.gui.add_checkbox("Show Current Frame", initial_value=True)
             if hasattr(self, 'original_images') and len(self.original_images) > 0:
                 self.current_frame_image = self.server.gui.add_image(
-                    self.original_images[0], label="Current Frame"
+                    self.original_images[-1], label="Current Frame"
                 )
             else:
                 self.current_frame_image = None
 
         # Preset view direction buttons
-        with self.server.gui.add_folder("Reset View Direction"):
+        with self.server.gui.add_folder("Reset View Direction", expand_by_default=False):
             btn_look_at_center = self.server.gui.add_button(
                 "Look At Scene Center",
                 hint="Reset orbit center to the scene center (fixes orbit after dragging).",
@@ -409,7 +581,8 @@ class PointCloudViewer:
             "Camera Size", min=0.01, max=0.5, step=0.01, initial_value=0.1
         )
         self.downsample_slider = self.server.gui.add_slider(
-            "Downsample Factor", min=1, max=1000, step=1, initial_value=10
+            "Downsample Factor", min=1, max=1000, step=1,
+            initial_value=self.downsample_factor
         )
         self.show_camera_checkbox = self.server.gui.add_checkbox(
             "Show Camera", initial_value=self.show_camera
@@ -423,7 +596,7 @@ class PointCloudViewer:
         )
 
         # Screenshot controls
-        with self.server.gui.add_folder("Screenshot"):
+        with self.server.gui.add_folder("Screenshot", expand_by_default=False):
             self.screenshot_button = self.server.gui.add_button("Take Screenshot")
             self.screenshot_resolution = self.server.gui.add_dropdown(
                 "Resolution",
@@ -442,7 +615,7 @@ class PointCloudViewer:
             self._take_screenshot(event.client)
 
         # GLB export controls
-        with self.server.gui.add_folder("Export GLB"):
+        with self.server.gui.add_folder("Export GLB", expand_by_default=False):
             self.glb_output_path = self.server.gui.add_text(
                 "Output Path", initial_value="export.glb"
             )
@@ -510,7 +683,7 @@ class PointCloudViewer:
             self._export_glb()
 
         # Video saving controls
-        with self.server.gui.add_folder("Video Saving"):
+        with self.server.gui.add_folder("Video Saving", expand_by_default=False):
             self.save_video_button = self.server.gui.add_button("Save Video", disabled=False)
             self.video_output_path = self.server.gui.add_text("Output Path", initial_value="output_pointcloud.mp4")
             self.video_save_fps = self.server.gui.add_slider("Video FPS", min=10, max=60, step=1, initial_value=30)
@@ -988,6 +1161,15 @@ class PointCloudViewer:
 
     def _connect_client(self, client: viser.ClientHandle):
         """Setup client connection callbacks."""
+        # Start in a stable reconstruction overview instead of relying on the
+        # browser's arbitrary initial orbit pose.
+        center, scale = self._compute_scene_center_and_scale()
+        direction = np.array([0.5, -0.6, 0.6], dtype=np.float64)
+        direction /= np.linalg.norm(direction)
+        client.camera.up_direction = (0.0, -1.0, 0.0)
+        client.camera.position = tuple(center + direction * scale * 1.5)
+        client.camera.look_at = tuple(center)
+
         wxyz_panel = client.gui.add_text("wxyz:", f"{client.camera.wxyz}")
         position_panel = client.gui.add_text("position:", f"{client.camera.position}")
         fov_panel = client.gui.add_text(
@@ -1168,11 +1350,12 @@ class PointCloudViewer:
         """Setup and run animation controls."""
         with self.server.gui.add_folder("Playback"):
             self.gui_timestep = self.server.gui.add_slider(
-                "Train Step", min=0, max=self.num_frames - 1, step=1, initial_value=0, disabled=False
+                "Frame", min=0, max=self.num_frames - 1, step=1,
+                initial_value=self.num_frames - 1, disabled=False
             )
             gui_next_frame = self.server.gui.add_button("Next Step", disabled=False)
             gui_prev_frame = self.server.gui.add_button("Prev Step", disabled=False)
-            gui_playing = self.server.gui.add_checkbox("Playing", True)
+            gui_playing = self.server.gui.add_checkbox("Playing", False)
             gui_framerate = self.server.gui.add_slider("FPS", min=1, max=60, step=0.1, initial_value=20)
             gui_framerate_options = self.server.gui.add_button_group("FPS options", ("10", "20", "30", "60"))
 

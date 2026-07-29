@@ -299,6 +299,69 @@ python demo.py --model_path /path/to/checkpoint.pt \
     --image_folder /path/to/images/ --use_sdpa
 ```
 
+#### AMD ROCm
+
+`demo.py` detects ROCm and automatically selects the validated AMD preset:
+SDPA, streaming inference, a stable prediction-head batch workaround, and
+inspection-oriented viewer defaults. ROCm's single-frame DPT convolution path
+produced non-finite depth and confidence values; the workaround evaluates eight
+identical independent head samples and keeps the first result. The transformer
+still processes each new frame only once. A 64-frame RX 7900 XTX validation was
+fully finite at 518x294, using 12.5 GB allocated and 15.0 GB reserved peak VRAM.
+
+```bash
+python demo.py --model_path /path/to/checkpoint.pt \
+    --image_folder example/loop
+```
+
+Streaming preserves one continuous model state and is now the AMD default.
+Use `--mode windowed` when a sequence exceeds the model's learned motion range
+or camera poses begin to drift; windowing is a quality/reset option rather than
+a numerical-stability requirement.
+
+The viewer opens paused on the final frame in accumulated 3D mode, with camera
+frustums hidden. On AMD the initial confidence threshold is `1.5`, point size is
+`0.001`, display downsampling is `2`, and a conservative relative depth-edge
+filter of `0.15` removes boundary streaks before unprojection. Explicit CLI
+values still override these visualization defaults. Use
+`--depth_edge_threshold 0` to disable the filter or provide another positive
+ratio to tune it for a scene.
+
+ROCm also caps preprocessed height at `294` while retaining the checkpoint's
+required `518` width. The tested 518×392 SDPA shape produced non-finite depth on
+AMD; `--max_image_height` can override the center-crop cap when testing another
+backend or PyTorch build.
+
+Use `--diagnose_geometry` when a reconstruction contains apparent sheets or
+discontinuities. It reports unusually planar frame clouds, camera-pose jumps,
+and per-window alignment scales without changing the reconstruction.
+Once a bad depth frame is identified, `--exclude_point_frames 3,8-10` omits
+those frames from displayed geometry while preserving their inference context,
+camera poses, and source images.
+
+For controlled comparisons, see [BENCHMARK.md](BENCHMARK.md). `--save_run`
+captures raw reconstruction arrays and reproducibility metadata, while
+`benchmark.py` reports independent validity, roughness, adjacent-agreement, and
+manually scoped layer-thickness metrics. Repeated runs are required on ROCm;
+the tested stack has meaningful depth-output variance.
+
+Monocular reconstruction has no gravity reference, so a level floor may appear
+sloped when the anchor camera is pitched. Pass `--level_floor` to robustly fit
+the dominant floor-like plane and rigidly rotate the reconstruction and camera
+poses until that plane is horizontal. This changes orientation only, not scale,
+distances, or scene shape.
+
+Use `--voxel_fusion` to replace overlapping per-frame depth sheets with one
+point per spatial voxel, retaining only voxels observed by at least two distinct
+frames. The voxel size is selected from trajectory scale by default; tune with
+`--voxel_size`, `--min_view_support`, and `--fusion_pixel_stride`. Fusion keeps
+frame playback progressive by assigning each fused voxel to the mean frame that
+observed it. The automatic size targets roughly 1/430 of the reconstructed
+camera-trajectory extent; use a smaller explicit size for more density.
+`--min_view_support 0` is adaptive: it requires two-frame agreement when at
+least 35% of occupied voxels have it, then falls back to one-frame voxel
+averaging for poorly aligned scenes where strict consensus would be illegible.
+
 #### Running on Limited GPU Memory
 
 If you run into out-of-memory issues, try one (or both) of the following:
